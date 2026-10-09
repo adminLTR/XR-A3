@@ -12,17 +12,10 @@
 
   <div id="hud">
     <label>Participant <input id="participantId" value="P01" size="4" /></label>
-    <label>Order
-      <select id="orderSelect">
-        <option value="ABBA">ABBA — WIM, Teleport, Teleport, WIM</option>
-        <option value="BAAB">BAAB — Teleport, WIM, WIM, Teleport</option>
-      </select>
-    </label>
-    <button id="startSessionBtn" type="button">Start session</button>
-    <label>Practice
+    <label>Technique
       <select id="techniqueSelect">
         <option value="1">1 — WIM</option>
-        <option value="2">2 — Teleport</option>
+        <option value="2">2 — Joystick</option>
       </select>
     </label>
     <span id="trialCount">Practice</span>
@@ -34,11 +27,11 @@
   <div id="liveErrors" aria-live="polite">—</div>
 
   <div id="help">
-    Entra en VR y pulsa <b>A</b> en el control derecho (o Start session en el monitor) para grabar 4 trials. Practice no se guarda.
-    <b>WIM:</b> mantén el grip izquierdo, agarra el cono naranja con el gatillo derecho y suéltalo; la vista salta al soltar. El cono magenta es el norte.
-    <b>Teleport:</b> apunta el control derecho al suelo y pulsa el gatillo.
-    <b>Confirmar:</b> entra en el anillo cian (1 m) y pulsa el grip derecho. X izquierdo sale de VR.
-    Escritorio (solo práctica): botón derecho para mirar, clic en el suelo teletransporta, en WIM arrastra el cono, Enter confirma.
+    Elige WIM o Joystick en el selector. Cada confirmación dentro del círculo verde se guarda.
+    <b>WIM:</b> la casa está en la mano izquierda. El muñeco rojo eres tú y el círculo verde es el objetivo. Agárralo con el gatillo derecho y suéltalo; la vista salta al soltar.
+    <b>Joystick:</b> palanca izquierda para caminar. Las paredes no detienen.
+    <b>Confirmar:</b> entra en el círculo (1 m) y pulsa el grip derecho. Arriba, dPos se pone verde. X izquierdo sale de VR. Download CSV al terminar.
+    Escritorio: botón derecho mira, WASD camina en Joystick, en WIM arrastra el muñeco, Enter confirma.
   </div>
 
   <script type="importmap">

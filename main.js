@@ -4,23 +4,23 @@
 // The participant docks their viewpoint onto a beacon, not a cube onto a pose.
 //
 // Technique 1 — World-in-Miniature (Class 9).
-//   Left grip shows a scaled clone of the world. The orange cone is the head.
+//   The scaled house sits on the left hand. The red person is the head.
 //   Right trigger grabs it; the viewpoint jumps only when the trigger is released.
 //   The miniature is parented to the left grip with no extra yaw, so turning
-//   the wrist turns the map. The magenta cone marks world north (−Z).
+//   the wrist turns the map. The green circle is the beacon.
 //
-// Technique 2 — ray teleport. Design draft: design-technique2.txt.
-//   Right controller −Z ray ∩ floor, trigger snaps the head there.
-//   One egocentric frame, no continuous motion.
+// Technique 2 — left-joystick locomotion.
+//   Left thumbstick moves the rig on XZ in the direction the head is facing.
+//   No wall collisions. Same path rule as WIM: horizontal head travel, so a
+//   WIM jump and a walked path are comparable.
 //
 // Path rule (both techniques): horizontal head travel per frame, so a jump
 // counts as a segment of that length and physical walking counts too.
 //
 // Parameters, stated for the report:
-//   Environment: 20 × 20 m. A2 docking bounds were about 2 m across.
-//   Beacon spawns at least 6 m from the head (arm reach cannot finish a trial).
-//   Confirm radius: 1.0 m horizontal (middle of the 0.75–1.5 m suggestion).
-//   The cyan ring on the ground is that radius.
+//   Environment: a 16 × 16 m house (four 8 m rooms) on a 20 × 20 m lot.
+//   Beacon is a green floor circle, at least 6 m from the head.
+//   Confirm radius: 1.0 m horizontal — the green circle itself.
 
 import * as THREE from "three";
 import { VRButton } from "three/addons/webxr/VRButton.js";
@@ -30,14 +30,19 @@ const ENV_HALF = ENV_SIZE / 2;
 const CONFIRM_RADIUS = 1.0;
 const MIN_BEACON_DIST = 6;
 const WIM_SCALE = 0.35 / ENV_SIZE;
-const MARKER_HEIGHT = 0.08;
+const MARKER_HEIGHT = 0.05;
+const JOY_SPEED = 2.6;
+const JOY_DEAD = 0.15;
+const ROOMS = [
+  { x: -4, z: -4 },
+  { x: 4, z: -4 },
+  { x: -4, z: 4 },
+  { x: 4, z: 4 },
+];
 const EYE_HEIGHT = 1.6;
-const SESSION_LENGTH = 4;
 
 const participantIdInput = document.getElementById("participantId");
-const orderSelect = document.getElementById("orderSelect");
 const techniqueSelect = document.getElementById("techniqueSelect");
-const startSessionBtn = document.getElementById("startSessionBtn");
 const trialCountEl = document.getElementById("trialCount");
 const confirmBtn = document.getElementById("confirmBtn");
 const downloadBtn = document.getElementById("downloadBtn");
@@ -58,13 +63,12 @@ const CSV_HEADER = [
 const rows = [];
 const _head = new THREE.Vector3();
 const _forward = new THREE.Vector3();
-const _aimPoint = new THREE.Vector3();
 const _raycaster = new THREE.Raycaster();
 const _rayMatrix = new THREE.Matrix4();
 const lastHead = new THREE.Vector3();
 
 let scene, camera, renderer;
-let world, floorMesh, beacon, beaconBulbMat, beaconRingMat;
+let world, floorMesh, beacon;
 let xrRig, mini, marker;
 let leftGrip = null;
 const controllers = [];
@@ -73,27 +77,21 @@ let technique = 1;
 let markerDragging = false;
 let markerDragController = null;
 let desktopDrag = false;
-let leftGripHeld = false;
-let teleportPoint = null;
+const keysDown = new Set();
 
-let logging = false;
-let sessionActive = false;
-let sessionComplete = false;
-let sessionOrder = [];
-let sessionIndex = 0;
 let trialCountByTechnique = { 1: 0, 2: 0 };
+let presentationOrder = 0;
 let straightLineDistance = 0;
 let pathLength = 0;
 let pathReady = false;
 let trialStartTime = 0;
-let lastConfirmAt = 0;
+let lastConfirmAt = -1e9;
 let pendingTrialReset = false;
 
 let yaw = 0;
 let pitch = 0;
 let lookDragging = false;
 let xrExitWasDown = false;
-let aWasDown = false;
 
 let vrHud = null;
 
@@ -121,93 +119,153 @@ function buildWorld() {
   world = new THREE.Group();
   world.name = "world";
 
+  const mats = new Map();
+  const mat = (color) => {
+    let material = mats.get(color);
+    if (!material) {
+      material = new THREE.MeshStandardMaterial({ color, roughness: 0.86, metalness: 0.02 });
+      mats.set(color, material);
+    }
+    return material;
+  };
+  const box = (w, h, d, x, y, z, color) => {
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat(color));
+    mesh.position.set(x, y, z);
+    world.add(mesh);
+    return mesh;
+  };
+  const cyl = (radius, height, x, y, z, color, segments = 12) => {
+    const mesh = new THREE.Mesh(
+      new THREE.CylinderGeometry(radius, radius, height, segments),
+      mat(color)
+    );
+    mesh.position.set(x, y, z);
+    world.add(mesh);
+    return mesh;
+  };
+
   floorMesh = new THREE.Mesh(
     new THREE.PlaneGeometry(ENV_SIZE, ENV_SIZE),
-    new THREE.MeshStandardMaterial({ color: 0x3d4a3f, roughness: 1 })
+    mat(0x6d9a52)
   );
   floorMesh.rotation.x = -Math.PI / 2;
   floorMesh.name = "floor";
   world.add(floorMesh);
 
-  world.add(new THREE.GridHelper(ENV_SIZE, 20, 0x6a746c, 0x2a332c));
+  // 16 m house, four 8 m rooms. Open ceiling so the miniature stays readable.
+  // NW living, NE bedroom, SW kitchen, SE study. Walls sit on x/z = 0 and ±8.
+  const WALL_H = 2.55;
+  const WALL_T = 0.16;
+  const DOOR_W = 1.45;
+  const DOOR_H = 2.05;
+  const HALF = 8;
+  const headerH = WALL_H - DOOR_H;
 
-  const curbMat = new THREE.MeshStandardMaterial({ color: 0x9aa59a });
-  const curbH = 0.08;
-  const curbT = 0.12;
-  const curbs = [
-    [0, -ENV_HALF, ENV_SIZE, curbT],
-    [0, ENV_HALF, ENV_SIZE, curbT],
-    [-ENV_HALF, 0, curbT, ENV_SIZE],
-    [ENV_HALF, 0, curbT, ENV_SIZE],
-  ];
-  for (const [x, z, w, d] of curbs) {
-    const curb = new THREE.Mesh(new THREE.BoxGeometry(w, curbH, d), curbMat);
-    curb.position.set(x, curbH / 2, z);
-    world.add(curb);
-  }
+  const wallX = (z, x0, x1) => {
+    const span = Math.abs(x1 - x0);
+    if (span < 0.05) return;
+    box(span, WALL_H, WALL_T, (x0 + x1) / 2, WALL_H / 2, z, 0xf4f0e6);
+  };
+  const wallZ = (x, z0, z1) => {
+    const span = Math.abs(z1 - z0);
+    if (span < 0.05) return;
+    box(WALL_T, WALL_H, span, x, WALL_H / 2, (z0 + z1) / 2, 0xf4f0e6);
+  };
+  const doorX = (z, x) => {
+    box(DOOR_W, headerH, WALL_T, x, DOOR_H + headerH / 2, z, 0xf4f0e6);
+  };
+  const doorZ = (x, z) => {
+    box(WALL_T, headerH, DOOR_W, x, DOOR_H + headerH / 2, z, 0xf4f0e6);
+  };
 
-  const pillar = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.7, 0.8, 5, 16),
-    new THREE.MeshStandardMaterial({ color: 0xd12b2b })
-  );
-  pillar.position.set(-6, 2.5, -6);
-  pillar.name = "pillar";
-  world.add(pillar);
+  box(7.55, 0.04, 7.55, -4, 0.03, -4, 0xd2b48c);
+  box(7.55, 0.04, 7.55, 4, 0.03, -4, 0x8eb6d9);
+  box(7.55, 0.04, 7.55, -4, 0.03, 4, 0xf0d56a);
+  box(7.55, 0.04, 7.55, 4, 0.03, 4, 0xa56b3c);
 
-  const archMat = new THREE.MeshStandardMaterial({ color: 0x2f6fed });
-  const arch = new THREE.Group();
-  arch.name = "arch";
-  const columnGeom = new THREE.CylinderGeometry(0.28, 0.28, 3.2, 12);
-  const leftCol = new THREE.Mesh(columnGeom, archMat);
-  leftCol.position.set(-1.3, 1.6, 0);
-  const rightCol = new THREE.Mesh(columnGeom, archMat);
-  rightCol.position.set(1.3, 1.6, 0);
-  const lintel = new THREE.Mesh(new THREE.BoxGeometry(3.2, 0.45, 0.55), archMat);
-  lintel.position.set(0, 3.35, 0);
-  arch.add(leftCol, rightCol, lintel);
-  arch.position.set(6, 0, -2);
-  world.add(arch);
+  wallZ(-HALF, -HALF, HALF);
+  wallZ(HALF, -HALF, HALF);
+  wallX(-HALF, -HALF, HALF);
+  wallX(HALF, -HALF, -DOOR_W / 2);
+  wallX(HALF, DOOR_W / 2, HALF);
+  doorX(HALF, 0);
 
-  const wall = new THREE.Mesh(
-    new THREE.BoxGeometry(6, 3, 0.45),
-    new THREE.MeshStandardMaterial({ color: 0xf0d030 })
-  );
-  wall.position.set(-1, 1.5, 6.5);
-  wall.name = "wall";
-  world.add(wall);
+  const gap = DOOR_W / 2;
+  wallZ(0, -HALF, -4 - gap);
+  wallZ(0, -4 + gap, 4 - gap);
+  wallZ(0, 4 + gap, HALF);
+  doorZ(0, -4);
+  doorZ(0, 4);
+  wallX(0, -HALF, -4 - gap);
+  wallX(0, -4 + gap, 4 - gap);
+  wallX(0, 4 + gap, HALF);
+  doorX(0, -4);
+  doorX(0, 4);
 
-  beaconBulbMat = new THREE.MeshStandardMaterial({
-    color: 0xe9ffff,
-    emissive: 0x22ddff,
-    emissiveIntensity: 0.9,
-  });
-  beaconRingMat = new THREE.MeshBasicMaterial({
-    color: 0x22ddff,
-    side: THREE.DoubleSide,
-    transparent: true,
-    opacity: 0.9,
-  });
+  const windowMat = 0x9fd4ee;
+  box(1.3, 0.9, 0.04, -4, 1.55, -HALF + 0.02, windowMat);
+  box(1.3, 0.9, 0.04, 4, 1.55, -HALF + 0.02, windowMat);
+  box(0.04, 0.9, 1.3, -HALF + 0.02, 1.55, -4, windowMat);
+  box(0.04, 0.9, 1.3, HALF - 0.02, 1.55, -4, windowMat);
+  box(0.04, 0.9, 1.3, -HALF + 0.02, 1.55, 4, windowMat);
+  box(0.04, 0.9, 1.3, HALF - 0.02, 1.55, 4, windowMat);
+
+  // Living room — red sofa, lamp, rug.
+  box(2.2, 0.02, 1.6, -4, 0.06, -5.1, 0xc0392b);
+  box(2.1, 0.32, 0.72, -4, 0.28, -6.85, 0xd12b2b);
+  box(2.1, 0.42, 0.16, -4, 0.58, -7.18, 0xa11f1f);
+  box(0.9, 0.28, 0.55, -4, 0.24, -5.15, 0x6b4226);
+  cyl(0.06, 1.35, -6.7, 0.75, -6.7, 0x222222);
+  cyl(0.22, 0.16, -6.7, 1.48, -6.7, 0xff4444, 16);
+  cyl(0.12, 0.16, -1.7, 0.14, -6.6, 0x6b4226);
+  cyl(0.22, 0.28, -1.7, 0.36, -6.6, 0x2f8f4e, 10);
+
+  // Bedroom — blue bed and wardrobe.
+  box(1.7, 0.55, 0.12, 4, 0.72, -7.2, 0x1d4e89);
+  box(1.55, 0.28, 2.05, 4, 0.32, -6.05, 0x3d7edb);
+  box(0.55, 0.1, 0.32, 4, 0.51, -6.85, 0xf7f7f7);
+  box(0.42, 0.32, 0.38, 5.55, 0.26, -6.7, 0x2456a8);
+  box(0.4, 1.7, 1.35, 6.85, 0.95, -4.2, 0x1a4f9c);
+
+  // Kitchen — yellow counters, fridge, table.
+  box(0.55, 0.9, 3.2, -7.15, 0.55, 3.4, 0xf0d030);
+  box(2.4, 0.9, 0.55, -5.2, 0.55, 6.85, 0xe6c200);
+  box(0.7, 1.85, 0.7, -6.15, 1.02, 6.55, 0xf4f4f4);
+  box(1.15, 0.08, 0.7, -3.6, 0.78, 3.6, 0xc48a3a);
+  cyl(0.04, 0.7, -4.05, 0.4, 3.35, 0x6b4226);
+  cyl(0.04, 0.7, -3.15, 0.4, 3.35, 0x6b4226);
+  cyl(0.04, 0.7, -4.05, 0.4, 3.85, 0x6b4226);
+  cyl(0.04, 0.7, -3.15, 0.4, 3.85, 0x6b4226);
+  box(0.35, 0.45, 0.35, -3.6, 0.32, 2.55, 0xd35400);
+
+  // Study — desk, chair, bookshelf.
+  box(1.4, 0.08, 0.65, 4.2, 0.78, 5.6, 0x6b4226);
+  cyl(0.04, 0.7, 3.65, 0.4, 5.35, 0x5c3a1e);
+  cyl(0.04, 0.7, 4.75, 0.4, 5.35, 0x5c3a1e);
+  cyl(0.04, 0.7, 3.65, 0.4, 5.85, 0x5c3a1e);
+  cyl(0.04, 0.7, 4.75, 0.4, 5.85, 0x5c3a1e);
+  box(0.38, 0.42, 0.38, 4.2, 0.28, 4.85, 0x8d6a45);
+  box(0.32, 1.9, 1.5, 6.85, 1.05, 6.15, 0x5c3a1e);
+  box(0.08, 0.28, 1.2, 6.66, 1.55, 6.15, 0xc0392b);
+  box(0.08, 0.22, 1.15, 6.66, 1.15, 6.15, 0x2471a3);
+  box(0.08, 0.22, 1.1, 6.66, 0.75, 6.15, 0x1e8449);
+  cyl(0.14, 0.18, 1.7, 0.16, 6.4, 0x6b4226);
+  cyl(0.26, 0.36, 1.7, 0.42, 6.4, 0x27ae60, 10);
 
   beacon = new THREE.Group();
   beacon.name = "beacon";
-  const pole = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.08, 0.08, 3.2, 10),
-    new THREE.MeshStandardMaterial({
-      color: 0x087080,
-      emissive: 0x0a6a78,
-      emissiveIntensity: 0.6,
-    })
+  const disc = new THREE.Mesh(
+    new THREE.CylinderGeometry(CONFIRM_RADIUS, CONFIRM_RADIUS, 0.05, 40),
+    new THREE.MeshBasicMaterial({ color: 0x22c55e })
   );
-  pole.position.y = 1.6;
-  const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.28, 16, 12), beaconBulbMat);
-  bulb.position.y = 3.35;
+  disc.position.y = 0.08;
   const ring = new THREE.Mesh(
-    new THREE.RingGeometry(CONFIRM_RADIUS - 0.06, CONFIRM_RADIUS, 48),
-    beaconRingMat
+    new THREE.RingGeometry(CONFIRM_RADIUS * 0.78, CONFIRM_RADIUS, 40),
+    new THREE.MeshBasicMaterial({ color: 0xc8ffd4, side: THREE.DoubleSide })
   );
   ring.rotation.x = -Math.PI / 2;
-  ring.position.y = 0.04;
-  beacon.add(pole, bulb, ring);
+  ring.position.y = 0.12;
+  beacon.add(disc, ring);
   world.add(beacon);
 }
 
@@ -223,38 +281,49 @@ function buildMini() {
   clonedLights.forEach((light) => light.removeFromParent());
   mini.scale.setScalar(WIM_SCALE);
 
-  const markerGeom = new THREE.ConeGeometry(MARKER_HEIGHT / 2.2, MARKER_HEIGHT, 10);
-  markerGeom.translate(0, MARKER_HEIGHT / 2, 0);
-  const markerMat = new THREE.MeshBasicMaterial({ color: 0xff8800 });
-  const body = new THREE.Mesh(markerGeom, markerMat);
-  const nose = new THREE.Mesh(
-    new THREE.BoxGeometry(0.012, 0.012, 0.045),
-    markerMat
-  );
-  nose.position.set(0, MARKER_HEIGHT * 0.45, 0.03);
-  marker = new THREE.Group();
-  marker.name = "userMarker";
-  marker.add(body, nose);
-  // Undo the miniature shrink so the cone is MARKER_HEIGHT tall in the hand.
+  marker = buildPersonMarker();
+  // Undo the miniature shrink so the figure is MARKER_HEIGHT tall in the hand.
   marker.scale.setScalar(1 / WIM_SCALE);
   mini.add(marker);
+}
 
-  const northGeom = new THREE.ConeGeometry(0.025, 0.06, 8);
-  northGeom.translate(0, 0.03, 0);
-  const north = new THREE.Mesh(
-    northGeom,
-    new THREE.MeshBasicMaterial({ color: 0xff2bd6 })
+function buildPersonMarker() {
+  const mat = new THREE.MeshBasicMaterial({ color: 0xe10600 });
+  const h = MARKER_HEIGHT;
+  const person = new THREE.Group();
+  person.name = "userMarker";
+
+  const leg = new THREE.BoxGeometry(h * 0.12, h * 0.32, h * 0.12);
+  const leftLeg = new THREE.Mesh(leg, mat);
+  leftLeg.position.set(-h * 0.09, h * 0.16, 0);
+  const rightLeg = new THREE.Mesh(leg, mat);
+  rightLeg.position.set(h * 0.09, h * 0.16, 0);
+
+  const torso = new THREE.Mesh(new THREE.BoxGeometry(h * 0.34, h * 0.32, h * 0.16), mat);
+  torso.position.y = h * 0.46;
+  const head = new THREE.Mesh(new THREE.SphereGeometry(h * 0.13, 12, 10), mat);
+  head.position.y = h * 0.74;
+
+  const arm = new THREE.BoxGeometry(h * 0.08, h * 0.26, h * 0.08);
+  const leftArm = new THREE.Mesh(arm, mat);
+  leftArm.position.set(-h * 0.22, h * 0.48, 0);
+  const rightArm = new THREE.Mesh(arm, mat);
+  rightArm.position.set(h * 0.22, h * 0.48, 0);
+
+  const hit = new THREE.Mesh(
+    new THREE.SphereGeometry(h * 1.15, 8, 6),
+    new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false })
   );
-  north.scale.setScalar(1 / WIM_SCALE);
-  north.position.set(0, 0, -ENV_HALF + 1.2);
-  north.name = "north";
-  mini.add(north);
+  hit.position.y = h * 0.45;
+  person.add(leftLeg, rightLeg, torso, head, leftArm, rightArm, hit);
+  return person;
 }
 
 function mountMiniDesktop() {
   camera.add(mini);
-  mini.position.set(0.22, -0.18, -0.6);
-  mini.quaternion.identity();
+  // Plan view in the lower-right. In VR the grip pose replaces this.
+  mini.position.set(0.58, -0.2, -0.95);
+  mini.rotation.set(Math.PI / 2, 0, 0);
   mini.visible = technique === 1;
 }
 
@@ -263,15 +332,11 @@ function attachMiniToLeftHand() {
   leftGrip.add(mini);
   mini.position.set(0, 0.12, -0.05);
   mini.quaternion.identity();
-  mini.visible = leftGripHeld && technique === 1;
+  mini.visible = technique === 1;
 }
 
 function refreshMiniVisibility() {
-  if (!renderer.xr.isPresenting) {
-    mini.visible = technique === 1;
-    return;
-  }
-  mini.visible = technique === 1 && leftGripHeld;
+  mini.visible = technique === 1;
 }
 
 function syncMiniBeacon() {
@@ -336,64 +401,71 @@ function controllerRaycast(controller, objects) {
   return _raycaster.intersectObjects(objects, true);
 }
 
-function rightController() {
-  return (
-    controllers.find((controller) => controller.userData.handedness === "right") ||
-    controllers[1] ||
-    null
-  );
-}
+const _joyRight = new THREE.Vector3();
+const _joyQuat = new THREE.Quaternion();
+const _joyEuler = new THREE.Euler(0, 0, 0, "YXZ");
 
-function setControllerRayLength(controller, length) {
-  if (!controller) return;
-  const ray = controller.getObjectByName("ray");
-  if (ray) ray.scale.z = length;
-}
-
-function updateTeleportAim() {
-  teleportPoint = null;
-  const controller = rightController();
-  if (!controller || !renderer.xr.isPresenting) return;
-  const hits = controllerRaycast(controller, [floorMesh]);
-  if (hits.length === 0) {
-    setControllerRayLength(controller, 8);
-    return;
+function readLeftStick() {
+  const session = renderer.xr.getSession();
+  if (!session) return null;
+  for (const source of session.inputSources) {
+    if (source.handedness !== "left" || !source.gamepad) continue;
+    const axes = source.gamepad.axes;
+    if (!axes || axes.length < 2) return { x: 0, y: 0 };
+    if (axes.length >= 4 && Math.hypot(axes[2], axes[3]) >= Math.hypot(axes[0], axes[1])) {
+      return { x: axes[2], y: axes[3] };
+    }
+    return { x: axes[0], y: axes[1] };
   }
-  const hit = hits[0];
-  if (Math.abs(hit.point.x) > ENV_HALF || Math.abs(hit.point.z) > ENV_HALF) {
-    setControllerRayLength(controller, 8);
-    return;
-  }
-  teleportPoint = _aimPoint.copy(hit.point);
-  setControllerRayLength(controller, Math.max(hit.distance, 0.2));
+  return null;
 }
 
-function tryTeleport() {
-  if (technique !== 2 || !teleportPoint) return;
-  moveHeadTo(teleportPoint.x, teleportPoint.z);
+function updateJoystick(dt) {
+  if (technique !== 2) return;
+  let x = 0;
+  let y = 0;
+  if (renderer.xr.isPresenting) {
+    const stick = readLeftStick();
+    if (!stick) return;
+    x = stick.x;
+    y = stick.y;
+    if (Math.hypot(x, y) < JOY_DEAD) return;
+  } else {
+    if (keysDown.has("KeyA")) x -= 1;
+    if (keysDown.has("KeyD")) x += 1;
+    if (keysDown.has("KeyW")) y -= 1;
+    if (keysDown.has("KeyS")) y += 1;
+    if (x === 0 && y === 0) return;
+    const len = Math.hypot(x, y);
+    x /= len;
+    y /= len;
+  }
+
+  let yawAngle = yaw;
+  if (renderer.xr.isPresenting) {
+    camera.getWorldQuaternion(_joyQuat);
+    _joyEuler.setFromQuaternion(_joyQuat);
+    yawAngle = _joyEuler.y;
+  }
+  _forward.set(-Math.sin(yawAngle), 0, -Math.cos(yawAngle));
+  _joyRight.set(Math.cos(yawAngle), 0, -Math.sin(yawAngle));
+  const step = JOY_SPEED * dt;
+  xrRig.position.addScaledVector(_joyRight, x * step);
+  xrRig.position.addScaledVector(_forward, -y * step);
 }
 
 function spawnBeacon(fromX, fromZ) {
-  const margin = CONFIRM_RADIUS + 0.5;
-  const min = -ENV_HALF + margin;
-  const max = ENV_HALF - margin;
-  let placed = null;
-  for (let i = 0; i < 80; i += 1) {
-    const x = THREE.MathUtils.randFloat(min, max);
-    const z = THREE.MathUtils.randFloat(min, max);
-    if (Math.hypot(x - fromX, z - fromZ) >= MIN_BEACON_DIST) {
-      placed = { x, z };
-      break;
+  const candidates = [];
+  for (const room of ROOMS) {
+    for (let i = 0; i < 8; i += 1) {
+      const x = room.x + THREE.MathUtils.randFloat(-1.6, 1.6);
+      const z = room.z + THREE.MathUtils.randFloat(-1.6, 1.6);
+      if (Math.hypot(x - fromX, z - fromZ) >= MIN_BEACON_DIST) candidates.push({ x, z });
     }
   }
-  if (!placed) {
-    const dirX = fromX >= 0 ? -1 : 1;
-    const dirZ = fromZ >= 0 ? -1 : 1;
-    placed = {
-      x: THREE.MathUtils.clamp(fromX + dirX * MIN_BEACON_DIST, min, max),
-      z: THREE.MathUtils.clamp(fromZ + dirZ * MIN_BEACON_DIST, min, max),
-    };
-  }
+  const placed = candidates.length
+    ? candidates[Math.floor(Math.random() * candidates.length)]
+    : { x: fromX >= 0 ? -6 : 6, z: fromZ >= 0 ? -6 : 6 };
   beacon.position.set(placed.x, 0, placed.z);
   syncMiniBeacon();
 }
@@ -425,103 +497,41 @@ function updatePath() {
 
 function updateTrialLabel() {
   if (!trialCountEl) return;
-  if (sessionActive) {
-    const name = technique === 1 ? "WIM" : "Teleport";
-    trialCountEl.textContent = `Trial ${sessionIndex + 1}/${SESSION_LENGTH} · ${name}`;
-  } else if (sessionComplete) {
-    trialCountEl.textContent = "Session complete";
-  } else {
-    trialCountEl.textContent = `Practice · ${technique === 1 ? "WIM" : "Teleport"}`;
-  }
+  const name = technique === 1 ? "WIM" : "Joystick";
+  trialCountEl.textContent = `${name} · trial ${trialCountByTechnique[technique] + 1}`;
 }
 
 function setTechnique(next) {
-  technique = next;
-  if (techniqueSelect) techniqueSelect.value = String(next);
+  technique = next === 2 ? 2 : 1;
+  if (techniqueSelect) techniqueSelect.value = String(technique);
   refreshMiniVisibility();
-  teleportPoint = null;
-}
-
-function setSessionUiLocked(locked) {
-  orderSelect.disabled = locked;
-  techniqueSelect.disabled = locked;
-  startSessionBtn.disabled = locked;
-  participantIdInput.disabled = locked;
-}
-
-function startSession(options = {}) {
-  if (sessionActive) return;
-  if (!options.force && !renderer.xr.isPresenting) {
-    setStatus("Entra en VR antes de Start session. Practice no se guarda.");
-    return;
-  }
-  if (!options.force && rows.length > 0) {
-    const ok = window.confirm(
-      "Esto borra las filas actuales. Descarga el CSV antes si todavía lo necesitas. ¿Continuar?"
-    );
-    if (!ok) return;
-  }
-  const order = options.order || orderSelect.value;
-  sessionOrder = order === "BAAB" ? [2, 1, 1, 2] : [1, 2, 2, 1];
-  sessionIndex = 0;
-  trialCountByTechnique = { 1: 0, 2: 0 };
-  rows.length = 0;
-  logging = true;
-  sessionActive = true;
-  sessionComplete = false;
-  setSessionUiLocked(true);
-  setTechnique(sessionOrder[0]);
-  startTrial();
-  setStatus("Sesión iniciada.");
 }
 
 function confirmTrial() {
   const now = performance.now();
   if (now - lastConfirmAt < 400) return;
-  if (sessionComplete) {
-    setStatus("Sesión guardada en memoria. Download CSV antes de la siguiente.");
-    return;
-  }
   if (!withinRadius()) {
-    setStatus(`Fuera del radio (${distanceToBeacon().toFixed(2)} m). Entra en el anillo cian.`);
+    setStatus(`Fuera del círculo (${distanceToBeacon().toFixed(2)} m).`);
     return;
   }
   lastConfirmAt = now;
 
-  if (!logging) {
-    startTrial();
-    return;
-  }
-
   const completionTimeS = (now - trialStartTime) / 1000;
-  const techniqueId = sessionOrder[sessionIndex];
-  trialCountByTechnique[techniqueId] += 1;
-  const ratio =
-    straightLineDistance > 0 ? pathLength / straightLineDistance : 0;
+  trialCountByTechnique[technique] += 1;
+  presentationOrder += 1;
+  const ratio = straightLineDistance > 0 ? pathLength / straightLineDistance : 0;
 
   rows.push({
     participant_id: participantId(),
-    technique: techniqueId,
-    trial_number: trialCountByTechnique[techniqueId],
-    presentation_order: sessionIndex + 1,
+    technique,
+    trial_number: trialCountByTechnique[technique],
+    presentation_order: presentationOrder,
     completion_time_s: completionTimeS.toFixed(3),
     path_length: pathLength.toFixed(4),
     straight_line_distance: straightLineDistance.toFixed(4),
     path_ratio: ratio.toFixed(4),
   });
 
-  sessionIndex += 1;
-  if (sessionIndex >= sessionOrder.length) {
-    logging = false;
-    sessionActive = false;
-    sessionComplete = true;
-    setSessionUiLocked(false);
-    updateTrialLabel();
-    setStatus("Sesión completa (4 trials). Download CSV.");
-    return;
-  }
-
-  setTechnique(sessionOrder[sessionIndex]);
   startTrial();
 }
 
@@ -553,29 +563,16 @@ function setStatus(text) {
 function updateStatus() {
   const distance = distanceToBeacon();
   const inside = distance <= CONFIRM_RADIUS;
-  beaconBulbMat.emissive.setHex(inside ? 0x44ff66 : 0x22ddff);
-  beaconRingMat.color.setHex(inside ? 0x44ff66 : 0x22ddff);
+  const text = `dPos ${distance.toFixed(3)}`;
 
-  const name = technique === 1 ? "WIM" : "Teleport";
-  const line1 = sessionActive
-    ? `${name} · trial ${sessionIndex + 1}/${SESSION_LENGTH}`
-    : sessionComplete
-      ? "Sesión completa — sal y descarga el CSV"
-      : renderer.xr.isPresenting
-        ? `Practice · ${name} · pulsa A para grabar`
-        : `Practice · ${name}`;
-  const line2 = inside
-    ? "Dentro del radio — grip derecho para confirmar"
-    : `${distance.toFixed(2)} m hasta el faro`;
-
-  statusEl.textContent = `${line1} · ${line2}`;
+  statusEl.textContent = text;
   statusEl.classList.toggle("in-tolerance", inside);
   if (liveErrorsEl) {
-    liveErrorsEl.textContent = `${line1} · ${line2}`;
+    liveErrorsEl.textContent = text;
     liveErrorsEl.classList.toggle("in-tolerance", inside);
     liveErrorsEl.style.display = renderer.xr.isPresenting ? "none" : "";
   }
-  updateVrHud(line1, line2, inside);
+  updateVrHud(text, inside);
 }
 
 function buildVrHud() {
@@ -590,23 +587,24 @@ function buildVrHud() {
   );
   mesh.position.set(0, -0.28, -1.05);
   mesh.renderOrder = 1000;
+  mesh.visible = false;
   camera.add(mesh);
-  vrHud = { ctx, texture, canvas, text: "" };
+  vrHud = { ctx, texture, canvas, mesh, text: "" };
 }
 
-function updateVrHud(line1, line2, inside) {
-  const text = `${line1}|${line2}|${inside}`;
-  if (!vrHud || vrHud.text === text) return;
-  vrHud.text = text;
+function updateVrHud(text, inside) {
+  if (!vrHud) return;
+  vrHud.mesh.visible = renderer.xr.isPresenting;
+  const key = `${text}|${inside}`;
+  if (vrHud.text === key) return;
+  vrHud.text = key;
   const ctx = vrHud.ctx;
   ctx.clearRect(0, 0, 512, 128);
   ctx.fillStyle = inside ? "rgba(18, 64, 36, 0.88)" : "rgba(8, 10, 14, 0.78)";
   ctx.fillRect(0, 0, 512, 128);
   ctx.fillStyle = inside ? "#d8ffe4" : "#ffffff";
-  ctx.font = "28px sans-serif";
-  ctx.fillText(line1, 18, 48);
-  ctx.font = "24px sans-serif";
-  ctx.fillText(line2, 18, 92);
+  ctx.font = "bold 42px sans-serif";
+  ctx.fillText(text, 18, 78);
   vrHud.texture.needsUpdate = true;
 }
 
@@ -662,7 +660,6 @@ function setupController(index, color) {
   controller.addEventListener("selectstart", onSelectStart);
   controller.addEventListener("selectend", onSelectEnd);
   controller.addEventListener("squeezestart", onSqueezeStart);
-  controller.addEventListener("squeezeend", onSqueezeEnd);
 
   if (index === 0) leftGrip = grip;
   return controller;
@@ -670,9 +667,8 @@ function setupController(index, color) {
 
 function onSelectStart(event) {
   const controller = event.target;
-  if (isLeft(controller)) return;
-  if (technique === 1) tryGrabMarker(controller);
-  else tryTeleport();
+  if (isLeft(controller) || technique !== 1) return;
+  tryGrabMarker(controller);
 }
 
 function onSelectEnd(event) {
@@ -682,18 +678,8 @@ function onSelectEnd(event) {
 }
 
 function onSqueezeStart(event) {
-  if (isLeft(event.target)) {
-    leftGripHeld = true;
-    refreshMiniVisibility();
-    return;
-  }
+  if (isLeft(event.target)) return;
   confirmTrial();
-}
-
-function onSqueezeEnd(event) {
-  if (!isLeft(event.target)) return;
-  leftGripHeld = false;
-  refreshMiniVisibility();
 }
 
 function isExitPressed(session) {
@@ -706,20 +692,9 @@ function isExitPressed(session) {
   return false;
 }
 
-function isRightADown(xrSession) {
-  for (const source of xrSession.inputSources) {
-    if (source.handedness !== "right") continue;
-    const gamepad = source.gamepad;
-    if (!gamepad || gamepad.buttons.length <= 4) continue;
-    if (gamepad.buttons[4].pressed) return true;
-  }
-  return false;
-}
-
 function updateVrExit() {
   if (!renderer.xr.isPresenting) {
     xrExitWasDown = false;
-    aWasDown = false;
     return;
   }
   const xrSession = renderer.xr.getSession();
@@ -727,12 +702,6 @@ function updateVrExit() {
   const pressed = isExitPressed(xrSession);
   if (pressed && !xrExitWasDown) xrSession.end();
   xrExitWasDown = pressed;
-
-  const aDown = isRightADown(xrSession);
-  if (aDown && !aWasDown && !sessionActive && !sessionComplete && rows.length === 0) {
-    startSession();
-  }
-  aWasDown = aDown;
 }
 
 function setupWebXR() {
@@ -746,7 +715,6 @@ function setupWebXR() {
     yaw = 0;
     pitch = 0;
     attachMiniToLeftHand();
-    leftGripHeld = false;
     pendingTrialReset = true;
   });
 
@@ -791,10 +759,7 @@ function onPointerDown(event) {
       const local = mini.worldToLocal(floorHits[0].point.clone());
       marker.position.set(local.x, 0, local.z);
     }
-    return;
   }
-  const hits = _raycaster.intersectObject(floorMesh, false);
-  if (hits.length > 0) moveHeadTo(hits[0].point.x, hits[0].point.z);
 }
 
 function onPointerMove(event) {
@@ -827,6 +792,7 @@ function onKeyDown(event) {
     confirmTrial();
     return;
   }
+  if (!renderer.xr.isPresenting) keysDown.add(event.code);
   if (renderer.xr.isPresenting) return;
   const step = 0.08;
   if (event.key === "ArrowLeft") yaw += step;
@@ -835,22 +801,27 @@ function onKeyDown(event) {
   if (event.key === "ArrowDown") pitch = Math.max(-1.2, pitch - step);
 }
 
-function suggestOrderFromId() {
-  if (sessionActive) return;
-  const n = parseInt(participantIdInput.value.replace(/\D/g, ""), 10);
-  if (!n) return;
-  orderSelect.value = n % 2 === 0 ? "BAAB" : "ABBA";
+function onKeyUp(event) {
+  keysDown.delete(event.code);
 }
 
+function onParticipantChange() {
+  trialCountByTechnique = { 1: 0, 2: 0 };
+  presentationOrder = 0;
+  startTrial();
+}
+
+const clock = new THREE.Clock();
+
 function animate() {
+  const dt = Math.min(clock.getDelta(), 0.05);
   if (pendingTrialReset) {
     pendingTrialReset = false;
-    if (!sessionComplete) startTrial();
+    startTrial();
   }
   updatePath();
   if (technique === 1) syncMarker();
-  if (technique === 2 && renderer.xr.isPresenting) updateTeleportAim();
-  else teleportPoint = null;
+  updateJoystick(dt);
   refreshMiniVisibility();
   updateVrExit();
   if (!renderer.xr.isPresenting) applyLook();
@@ -880,6 +851,7 @@ function main() {
 
   xrRig = new THREE.Group();
   xrRig.name = "xrRig";
+  xrRig.position.set(-4, 0, -4);
   xrRig.add(camera);
   scene.add(xrRig);
 
@@ -904,21 +876,15 @@ function main() {
   window.addEventListener("pointerup", onPointerUp);
   renderer.domElement.addEventListener("contextmenu", (event) => event.preventDefault());
   window.addEventListener("keydown", onKeyDown);
+  window.addEventListener("keyup", onKeyUp);
 
   confirmBtn.addEventListener("click", confirmTrial);
   downloadBtn.addEventListener("click", handleDownloadClick);
-  startSessionBtn.addEventListener("click", () => startSession());
   techniqueSelect.addEventListener("change", () => {
-    if (sessionActive) {
-      techniqueSelect.value = String(technique);
-      return;
-    }
-    sessionComplete = false;
     setTechnique(Number(techniqueSelect.value));
     startTrial();
   });
-  participantIdInput.addEventListener("change", suggestOrderFromId);
-  suggestOrderFromId();
+  participantIdInput.addEventListener("change", onParticipantChange);
 
   setTechnique(1);
   startTrial();
@@ -983,7 +949,7 @@ function runSelfTest() {
   const straight = Math.hypot(_head.x - beacon.position.x, _head.z - beacon.position.z);
   check(straight + 1e-4 >= MIN_BEACON_DIST, `beacon dist ${straight.toFixed(2)}`);
   check(rows.length === 0, "practice must not log");
-  lastConfirmAt = 0;
+  lastConfirmAt = -1e9;
   confirmTrial();
   check(rows.length === 0, "out-of-range confirm must not log");
 
@@ -993,13 +959,13 @@ function runSelfTest() {
   updatePath();
   check(Math.abs(pathLength - 5) < 0.05, `jump path ${pathLength.toFixed(3)}`);
 
-  startSession({ force: true, order: "ABBA" });
-  check(technique === 1 && sessionActive, "ABBA starts on WIM");
+  setTechnique(1);
+  startTrial();
   camera.getWorldPosition(_head);
   const expectedStraight = Math.hypot(_head.x - beacon.position.x, _head.z - beacon.position.z);
   moveHeadTo(beacon.position.x, beacon.position.z);
   updatePath();
-  lastConfirmAt = 0;
+  lastConfirmAt = -1e9;
   confirmTrial();
   check(rows.length === 1, "first logged row");
   if (rows[0]) {
@@ -1014,34 +980,27 @@ function runSelfTest() {
     CSV_HEADER.forEach((key) => check(rows[0][key] !== undefined && rows[0][key] !== "", `missing ${key}`));
   }
 
-  lastConfirmAt = 0;
+  lastConfirmAt = -1e9;
   confirmTrial();
   check(rows.length === 1, "second confirm outside radius must not log");
-  check(technique === 2, "second trial is teleport");
 
-  for (let i = 0; i < 3; i += 1) {
-    moveHeadTo(beacon.position.x, beacon.position.z);
-    updatePath();
-    lastConfirmAt = 0;
-    confirmTrial();
-  }
-  check(rows.length === 4, `expected 4 rows, got ${rows.length}`);
-  check(sessionComplete && !sessionActive, "session closes");
-  const techniques = rows.map((row) => row.technique).join(",");
-  const trials = rows.map((row) => row.trial_number).join(",");
-  const order = rows.map((row) => row.presentation_order).join(",");
-  check(techniques === "1,2,2,1", `ABBA techniques ${techniques}`);
-  check(trials === "1,1,2,2", `trial numbers ${trials}`);
-  check(order === "1,2,3,4", `presentation ${order}`);
+  setTechnique(2);
+  startTrial();
+  moveHeadTo(beacon.position.x, beacon.position.z);
+  updatePath();
+  lastConfirmAt = -1e9;
+  confirmTrial();
+  check(rows.length === 2, `expected 2 rows, got ${rows.length}`);
+  check(rows[1] && rows[1].technique === 2, "second row is joystick");
+  check(rows[1] && rows[1].trial_number === 1, "joystick trial_number restarts at 1");
+  check(rows[1] && rows[1].presentation_order === 2, "presentation order follows confirms");
   check(buildCsv().split("\n")[0] === CSV_HEADER.join(","), "csv header");
+  check(techniqueSelect.options.length === 2, "technique select has two options");
+  check(techniqueSelect.options[0].value === "1" && techniqueSelect.options[1].value === "2", "WIM then Joystick");
 
-  startSession({ force: true, order: "BAAB" });
-  check(technique === 2, "BAAB starts on teleport");
   rows.length = 0;
-  logging = false;
-  sessionActive = false;
-  sessionComplete = false;
-  setSessionUiLocked(false);
+  trialCountByTechnique = { 1: 0, 2: 0 };
+  presentationOrder = 0;
 
   xrRig.position.set(0, 0, 0);
   xrRig.rotation.set(0, 0, 0);
@@ -1056,7 +1015,6 @@ function runSelfTest() {
 
 window.__A3 = {
   rows,
-  startSession,
   confirmTrial,
   moveHeadTo,
   get technique() {
